@@ -1,0 +1,171 @@
+---
+
+## 2) app.py
+
+```python
+import os
+import tempfile
+import gradio as gr
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+# ASR
+from faster_whisper import WhisperModel
+
+# Translation
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import torch
+
+# TTS (XTTS v2)
+from TTS.api import TTS
+
+# Video/Audio utils
+from moviepy.editor import VideoFileClip, AudioFileClip
+import numpy as np
+
+# ---------- Config ----------
+whisper_size = os.getenv("WHISPER_SIZE", "small")  # small/base/medium/large-v3
+asr_model = WhisperModel(whisper_size, device="auto", compute_type="auto")
+
+m2m_model_name = "facebook/m2m100_418M"
+translator_tokenizer = AutoTokenizer.from_pretrained(m2m_model_name)
+translator_model = AutoModelForSeq2SeqLM.from_pretrained(m2m_model_name)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+translator_model = translator_model.to(device)
+
+# XTTS v2 loads by name via Coqui TTS hub (first run downloads weights)
+tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+
+LANG_OPTIONS = [
+    ("English", "en"), ("Hindi", "hi"), ("Bengali", "bn"), ("Urdu", "ur"), ("Tamil", "ta"),
+    ("Telugu", "te"), ("Marathi", "mr"), ("Gujarati", "gu"), ("Kannada", "kn"), ("Malayalam", "ml"),
+    ("Odia", "or"), ("Punjabi", "pa"), ("Assamese", "as"), ("Nepali", "ne"), ("Sinhala", "si"),
+    ("Arabic", "ar"), ("French", "fr"), ("German", "de"), ("Spanish", "es"), ("Portuguese", "pt"),
+    ("Italian", "it"), ("Russian", "ru"), ("Chinese", "zh"), ("Japanese", "ja"), ("Korean", "ko"),
+    ("Turkish", "tr"), ("Thai", "th"), ("Indonesian", "id"), ("Vietnamese", "vi"), ("Persian", "fa")
+]
+
+lang_to_m2m = {
+    "en": "en", "hi": "hi", "bn": "bn", "ur": "ur", "ta": "ta", "te": "te", "mr": "mr",
+    "gu": "gu", "kn": "kn", "ml": "ml", "or": "or", "pa": "pa", "as": "as", "ne": "ne",
+    "si": "si", "ar": "ar", "fr": "fr", "de": "de", "es": "es", "pt": "pt", "it": "it",
+    "ru": "ru", "zh": "zh", "ja": "ja", "ko": "ko", "tr": "tr", "th": "th", "id": "id",
+    "vi": "vi", "fa": "fa"
+}
+
+# ---------- Helpers ----------
+
+def extract_audio(video_path, out_wav):
+    clip = VideoFileClip(video_path)
+    audio = clip.audio
+    audio.write_audiofile(out_wav, fps=16000, codec="pcm_s16le")
+    clip.close()
+
+
+def run_asr(wav_path):
+    segments, info = asr_model.transcribe(wav_path, beam_size=5)
+    text = " ".join([seg.text.strip() for seg in segments])
+    return text, info.language
+
+
+def translate_text(text, tgt_lang):
+    tgt = lang_to_m2m.get(tgt_lang, "en")
+    # set forced language token for M2M100
+    translator_tokenizer.src_lang = "en"  # heuristic: asr often returns English when unknown
+    inputs = translator_tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    generated_tokens = translator_model.generate(**inputs, forced_bos_token_id=translator_tokenizer.get_lang_id(tgt))
+    out = translator_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+    return out
+
+
+def synth_tts(text, tgt_lang, ref_audio=None):
+    wav_out = tts.tts(text=text, language=tgt_lang, speaker_wav=ref_audio)
+    # Convert numpy array to temp wav path via soundfile
+    import soundfile as sf
+    tmp = tempfile.mktemp(suffix=".wav")
+    sf.write(tmp, wav_out, 24000)
+    return tmp
+
+
+def mux_audio(video_path, wav_path, out_path, time_stretch=False):
+    vclip = VideoFileClip(video_path)
+    aclip = AudioFileClip(wav_path)
+    if time_stretch:
+        # Simple duration adjust: stretch audio to video length
+        ratio = vclip.duration / max(aclip.duration, 0.001)
+        aclip = aclip.fx(lambda a: a.set_duration(a.duration * ratio))
+    vout = vclip.set_audio(aclip)
+    vout.write_videofile(out_path, codec="libx264", audio_codec="aac")
+    vclip.close(); aclip.close(); vout.close()
+
+
+def make_srt(transcript, out_path):
+    # naive single block SRT
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:00,000 --> 00:59:59,000\n" + transcript.strip() + "\n")
+
+
+def pipeline(video, target_lang, reference_voice=None, time_stretch=False):
+    with tempfile.TemporaryDirectory() as td:
+        video_path = video
+        audio_path = str(Path(td)/"audio.wav")
+        extract_audio(video_path, audio_path)
+
+        transcript, detected = run_asr(audio_path)
+        translated = translate_text(transcript, target_lang)
+
+        ref_path = reference_voice if reference_voice else None
+        tts_wav = synth_tts(translated, target_lang, ref_audio=ref_path)
+
+        out_mp4 = str(Path(td)/f"dub_{target_lang}.mp4")
+        mux_audio(video_path, tts_wav, out_mp4, time_stretch=time_stretch)
+
+        out_srt = str(Path(td)/f"subs_{target_lang}.srt")
+        make_srt(translated, out_srt)
+
+        # Save to persistent tmp inside Space
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        final_mp4 = f"dub_{target_lang}_{stamp}.mp4"
+        final_srt = f"subs_{target_lang}_{stamp}.srt"
+        Path(final_mp4).write_bytes(Path(out_mp4).read_bytes())
+        Path(final_srt).write_bytes(Path(out_srt).read_bytes())
+        return final_mp4, final_srt, transcript, translated, detected
+
+# ---------- UI ----------
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🎬 Video Dubber (XTTSv2 + M2M100 + Faster-Whisper)
+    Upload a short video, pick a target language, and (optionally) add a reference voice sample for cloning.
+    """)
+
+    with gr.Row():
+        video = gr.Video(label="Input Video (mp4/mov/webm)")
+        ref = gr.Audio(label="Optional Reference Voice (5–15 sec)", type="filepath")
+
+    target = gr.Dropdown(choices=[f"{name} ({code})" for name, code in LANG_OPTIONS], value="Hindi (hi)", label="Target Language")
+    time_stretch = gr.Checkbox(value=False, label="Time-stretch audio to video length (experimental)")
+
+    btn = gr.Button("Dub Video")
+
+    with gr.Row():
+        out_video = gr.Video(label="Dubbed Video")
+        out_srt = gr.File(label="SRT Subtitles")
+
+    with gr.Accordion("Details", open=False):
+        asr_text = gr.Textbox(label="ASR Transcript", lines=5)
+        tr_text = gr.Textbox(label="Translated Text", lines=5)
+        det_lang = gr.Textbox(label="Detected Source Language")
+
+    def _on_click(video, target, ref, time_stretch):
+        if not video:
+            raise gr.Error("Please upload a video.")
+        tcode = target.split("(")[-1].strip(") ")
+        mp4, srt, asr, tr, src = pipeline(video, tcode, reference_voice=ref, time_stretch=time_stretch)
+        return mp4, srt, asr, tr, src
+
+    btn.click(_on_click, inputs=[video, target, ref, time_stretch], outputs=[out_video, out_srt, asr_text, tr_text, det_lang])
+
+if __name__ == "__main__":
+    demo.launch()
