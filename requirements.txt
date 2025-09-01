@@ -1,0 +1,12 @@
+gradio>=4.44.0
+transformers>=4.42.0
+torch
+accelerate
+sentencepiece
+faster-whisper
+TTS>=0.22.0
+moviepy
+imageio-ffmpeg
+soundfile
+ffmpeg-python
+numpy
